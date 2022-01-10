@@ -41,12 +41,28 @@ Wind4Unity2AudioProcessor::Wind4Unity2AudioProcessor()
                        "Master Gain", "Master Gain", 0.0f, 1.0f, 0.5f));
    
    //    Distant Rain Parameters
-   addParameter(dstBPCutoffFreq = new juce::AudioParameterFloat(
-                       "DstCoff", "DistantIntensty", 0.004f, 1000.0f, 10.0f));
-   addParameter(dstBPQ = new juce::AudioParameterFloat(
-                       "DstQ", "DistantQ", 1.0f, 100.0f, 10.0f));
+//   addParameter(dstBPCutoffFreq = new juce::AudioParameterFloat(
+//                       "DstCoff", "DistantIntensty", 0.004f, 1000.0f, 10.0f));
+//   addParameter(dstBPQ = new juce::AudioParameterFloat(
+//                       "DstQ", "DistantQ", 1.0f, 100.0f, 10.0f));
    addParameter(dstAmplitude = new juce::AudioParameterFloat(
                        "DstAmp", "DistantAmpltd", 0.0001f, 1.5f, 0.75f));
+    
+//  Wind Speed Parameters
+    addParameter(windForce = new juce::AudioParameterInt("Wind Force", "Wind Force", 0, 12, 3));
+    addParameter(gustActive = new juce::AudioParameterBool("Gust Active", "Gust Active", false));
+    addParameter(gustDepth = new juce::AudioParameterFloat("Gust Depth", "Gust Depth", 0.0f, 1.0f, 0.5f));
+    addParameter(gustInterval = new juce::AudioParameterFloat("Gust Interval", "Gust Interval", 0.0f, 1.0f, 0.5f));
+    addParameter(squallActive = new juce::AudioParameterBool("Squall Active", "Squall Active", false));
+    addParameter(squallDepth = new juce::AudioParameterFloat("Squall Depth", "Squall Depth", 0.0f, 1.0f, 0.5f));
+    
+    //  Seed RNG
+    int seed = int(std::chrono::system_clock::now().time_since_epoch().count());
+    generator.seed(seed);
+        
+    //  Set Initial Wind Speed
+    windSpeedSet();
+    
 }
 
 Wind4Unity2AudioProcessor::~Wind4Unity2AudioProcessor()
@@ -63,6 +79,7 @@ void Wind4Unity2AudioProcessor::prepareToPlay (double sampleRate, int samplesPer
     spec.maximumBlockSize = samplesPerBlock;
     spec.numChannels = getTotalNumOutputChannels();
     spec.sampleRate = sampleRate;
+    currentSpec = spec;
     
     //    Prepare Distant Wind
     dstPrepare(spec);
@@ -80,6 +97,18 @@ void Wind4Unity2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 //    auto totalNumInputChannels  = getTotalNumInputChannels();
 //    auto totalNumOutputChannels = getTotalNumOutputChannels();
     buffer.clear();
+    
+    if (++currentWSComponentCounter > targetWSComponentCount)
+        windSpeedSet();
+     else
+        currentWindSpeed += deltaWindSpeed;
+    if (gustActive->get() || gustStatus == Closing)
+    {
+        computeGust();
+    } else if (gustStatus == Active)
+    {
+        gustClose();
+    }
     
     dstUpdateSettings();
     dstProcess(buffer);
@@ -109,8 +138,10 @@ void Wind4Unity2AudioProcessor::dstPrepare(const juce::dsp::ProcessSpec &spec)
     //    Prepare Filter
     dstBPF.prepare(spec);
     dstBPF.setType(juce::dsp::StateVariableTPTFilterType::bandpass);
-    dstBPF.setCutoffFrequency(dstBPCutoffFreq->get());
-    dstBPF.setResonance(dstBPQ->get());
+//    dstBPF.setCutoffFrequency(dstBPCutoffFreq->get());
+//    dstBPF.setResonance(dstBPQ->get());
+    dstBPF.setCutoffFrequency(10.0f);
+    dstBPF.setResonance(1.0f);
     dstBPF.reset();
 }
 
@@ -136,10 +167,183 @@ void Wind4Unity2AudioProcessor::dstProcess(juce::AudioBuffer<float> &buffer)
 void Wind4Unity2AudioProcessor::dstUpdateSettings()
 {
     //    Update Filter Settings
-    dstBPF.setCutoffFrequency(dstBPCutoffFreq->get());
-    dstBPF.setResonance(dstBPQ->get());
+//    dstBPF.setCutoffFrequency(dstBPCutoffFreq->get());
+//    dstBPF.setResonance(dstBPQ->get());
+    if (currentWindSpeed < 0)
+        currentWindSpeed = 0;
+    
+    dstBPF.setCutoffFrequency(juce::jlimit(0.004f, 1500.0f, (currentWindSpeed + currentGust) * 30.0f));
+    dstBPF.setResonance(1.0f + log(juce::jmax(1.0f, (currentWindSpeed + currentGust) * 0.1f)));
 }
 
+float Wind4Unity2AudioProcessor::randomNormal()
+{
+    return distribution(generator);
+}
+
+void Wind4Unity2AudioProcessor::windSpeedSet()
+{
+    int force = windForce->get();
+    if (force == 0)
+    {
+        targetWindSpeed = 0.0f;
+        targetWSComponentCount = (int) (currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    }
+    else
+    {
+        targetWindSpeed = meanWS[force] + sdWS[force] * randomNormal();
+        targetWSComponentCount = (int) ((10.0f + 2.0f * randomNormal()) / (force / 2.0f) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    }
+    
+    currentWSComponentCounter = 0;
+    deltaWindSpeed = (targetWindSpeed - currentWindSpeed) / (float) targetWSComponentCount;
+}
+
+void Wind4Unity2AudioProcessor::computeGust()
+{
+    // If first time set interval
+    if (!gustWasActive)
+    {
+        gustIntervalSet();
+        return;
+    }
+    // If Waiting, if end of Interval set gust/squall component and length
+    if (gustStatus == Waiting)
+    {
+        if (++currentGustIntervalCounter > targetGustIntervalCount)
+        {
+            if (squallActive->get())
+            {
+                squallSet();
+                squallLengthSet();
+            }
+            else
+            {
+                gustSet();
+                gustLengthSet();
+            }
+        }
+        return;
+    }
+    // If Active, Close if at end of length, set new gust/squall component if at
+    //    end of component, else increment gust speed
+    if (gustStatus == Active)
+    {
+        if (++currentGustLengthCounter > targetGustLengthCount)
+        {
+            gustClose();
+            return;
+        }
+        
+        if (++currentGustComponentCounter > targetGustComponentCount)
+        {
+            if (squallActive->get())
+            {
+                squallSet();
+            }
+            else
+            {
+                gustSet();
+            }
+        }
+        else
+        {
+            currentGust += deltaGust;
+        }
+        return;
+    }
+    // If Closing and end of component set gust speed zero, set wait length and return
+    //    else increment gust speed
+    if (gustStatus == Closing)
+    {
+        if (++currentGustComponentCounter > targetGustComponentCount)
+        {
+            gustWasActive = false;
+            gustStatus = Off;
+            currentGust = 0.0f;
+            return;
+        }
+        else
+        {
+            currentGust += deltaGust;
+        }
+    }
+
+}
+
+void Wind4Unity2AudioProcessor::gustSet()
+{
+    int force = windForce->get();
+    if (force < 3)
+    {
+        gustClose();
+        return;
+    }
+    else
+    {
+        targetGust = 15.0f * gustDepth->get() + 2.0f * sdWS[force] * randomNormal();
+        targetGustComponentCount = (int) ((1.0f + 0.25f * randomNormal()) / (force / 2.0f) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+        juce::jmax(targetGustComponentCount, 1);
+    }
+    
+    currentGustComponentCounter = 0;
+    deltaGust = (targetGust - currentGust) / (float) targetGustComponentCount;
+    gustStatus = Active;
+}
+
+void Wind4Unity2AudioProcessor::squallSet()
+{
+    int force = windForce->get();
+    if (force < 3)
+    {
+        gustClose();
+        return;
+    }
+    else
+    {
+        targetGust = 20.0f * squallDepth->get() + 2.0f * sdWS[force] * randomNormal();
+        targetGustComponentCount = (int) (((0.75f + 0.25f * randomNormal()) / (force / 2.0f)) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+        juce::jmax(targetGustComponentCount, 1);
+    }
+    
+    currentGustComponentCounter = 0;
+    deltaGust = (targetGust - currentGust) / (float) targetGustComponentCount;
+    gustStatus = Active;
+}
+
+void Wind4Unity2AudioProcessor::gustClose()
+{
+    targetGust = 0.0f;
+    targetGustComponentCount = (int) (2 * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    currentGustComponentCounter = 0;
+    deltaGust = (targetGust - currentGust) / (float) targetGustComponentCount;
+    gustStatus = Closing;
+}
+
+void Wind4Unity2AudioProcessor::gustIntervalSet()
+{
+    currentGustIntervalCounter = 0;
+    targetGustIntervalCount = (int) ((5.0f + gustInterval->get() * 100.0f + 10.0f * randomNormal()) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    juce::jmax(targetGustIntervalCount, 1);
+    gustStatus = Waiting;
+    gustWasActive = true;
+}
+
+void Wind4Unity2AudioProcessor::gustLengthSet()
+{
+    currentGustLengthCounter = 0;
+    targetGustLengthCount = (int) ((5.0f + 1.5f * randomNormal()) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    juce::jmax(targetGustLengthCount, 1);
+    gustStatus = Active;
+}
+
+void Wind4Unity2AudioProcessor::squallLengthSet()
+{
+    currentGustLengthCounter = 0;
+    targetGustLengthCount = (int) (((30.0f + 5.0f * randomNormal())) * currentSpec.sampleRate / currentSpec.maximumBlockSize);
+    juce::jmax(targetGustLengthCount, 1);
+    gustStatus = Active;
+}
 
 //==============================================================================
 // This creates new instances of the plugin..
