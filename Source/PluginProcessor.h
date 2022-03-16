@@ -114,10 +114,13 @@ private:
     juce::AudioParameterFloat* squallDepth;
     
     //  Distant Wind DSP Resources
+    /*
     juce::dsp::Oscillator<float> dstNoise1
     {[] (float x)
         { juce::Random r; return r.nextFloat() * 2.0f - 1.0f; }
     };
+    */
+    juce::Random r;
     
     juce::dsp::StateVariableTPTFilter<float> dstBPF;
     

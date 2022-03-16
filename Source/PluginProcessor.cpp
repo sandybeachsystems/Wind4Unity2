@@ -133,7 +133,7 @@ juce::AudioProcessorEditor* Wind4Unity2AudioProcessor::createEditor()
 void Wind4Unity2AudioProcessor::dstPrepare(const juce::dsp::ProcessSpec &spec)
 {
     //    Prepare Noise Source
-    dstNoise1.prepare(spec);
+//    dstNoise1.prepare(spec);
     
     //    Prepare Filter
     dstBPF.prepare(spec);
@@ -157,7 +157,8 @@ void Wind4Unity2AudioProcessor::dstProcess(juce::AudioBuffer<float> &buffer)
     {
         for (int s = 0; s < numSamples; ++s)
         {
-            float output = dstBPF.processSample(ch, dstNoise1.processSample(0.0f));
+            float output = r.nextFloat() * 2.0f - 1.0f;
+            output = dstBPF.processSample(ch, output);
             buffer.addSample(ch, s, output * dstFrameAmp);
         }
     }
